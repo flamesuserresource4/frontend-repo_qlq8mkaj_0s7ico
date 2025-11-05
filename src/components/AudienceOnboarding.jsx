@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   User,
   Users,
@@ -18,7 +18,33 @@ import {
   CheckCircle,
   Shield,
   Tag,
+  Mail,
+  Fingerprint,
+  Loader2,
 } from 'lucide-react';
+
+const API_BASE = import.meta.env.VITE_BACKEND_URL;
+
+function uuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+    const r = (Math.random() * 16) | 0,
+      v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+function useLocalUser() {
+  const [userId, setUserId] = useState(null);
+  useEffect(() => {
+    let id = localStorage.getItem('curalink_user_id');
+    if (!id) {
+      id = uuid();
+      localStorage.setItem('curalink_user_id', id);
+    }
+    setUserId(id);
+  }, []);
+  return userId;
+}
 
 function Card({ title, description, icon: Icon, items, anchor, onPrimary }) {
   return (
@@ -76,19 +102,32 @@ function SectionTitle({ eyebrow, title, description }) {
   );
 }
 
+function LoadingInline({ label }) {
+  return (
+    <span className="inline-flex items-center gap-2 text-slate-500 text-sm">
+      <Loader2 className="h-4 w-4 animate-spin" /> {label}
+    </span>
+  );
+}
+
 export default function AudienceOnboarding() {
+  const userId = useLocalUser();
   const [activeFlow, setActiveFlow] = useState(null); // 'patient' | 'researcher' | null
 
   // Shared state
-  const [favorites, setFavorites] = useState([]); // {type: 'publication'|'trial'|'expert'|'collaborator', id, title/name}
+  const [favorites, setFavorites] = useState([]); // persisted per user via API
+  const [favLoading, setFavLoading] = useState(false);
 
   // Patient state
+  const [patient, setPatient] = useState({ name: '', email: '' });
   const [patientText, setPatientText] = useState('');
   const [locations, setLocations] = useState({ city: '', country: '' });
   const [globalExperts, setGlobalExperts] = useState(false);
   const [conditions, setConditions] = useState(['Glioma']);
   const [submitted, setSubmitted] = useState(false);
   const [pubQuery, setPubQuery] = useState('');
+  const [pubResults, setPubResults] = useState([]);
+  const [pubLoading, setPubLoading] = useState(false);
 
   // Researcher state
   const specialtiesOpts = ['Oncology', 'Neurology', 'Immunology', 'Genetics', 'Radiology'];
@@ -98,31 +137,78 @@ export default function AudienceOnboarding() {
   const [orcid, setOrcid] = useState('');
   const [researchGate, setResearchGate] = useState('');
   const [availableMeetings, setAvailableMeetings] = useState(true);
+  const [rgPubs, setRgPubs] = useState([]);
+  const [rgLoading, setRgLoading] = useState(false);
 
   const popularConditions = ['Glioma', 'Lung Cancer', 'Breast Cancer', 'Leukemia', 'Brain Cancer'];
 
-  // Sample publications corpus for demo with links to top journals
-  const publicationsCorpus = [
-    { id: 'nejm-glioma-1', title: 'Targeted therapies for glioma: a 2024 overview', journal: 'NEJM', url: 'https://www.nejm.org/', keywords: ['glioma', 'oncology', 'targeted therapies'] },
-    { id: 'jama-lung-1', title: 'Screening advances in lung cancer', journal: 'JAMA', url: 'https://jamanetwork.com/', keywords: ['lung cancer', 'screening'] },
-    { id: 'natmed-immuno-1', title: 'New frontiers in immunotherapy', journal: 'Nature Medicine', url: 'https://www.nature.com/nm/', keywords: ['immunotherapy', 'oncology'] },
-    { id: 'lancet-ai-1', title: 'Clinical AI in oncology: promise and pitfalls', journal: 'The Lancet', url: 'https://www.thelancet.com/', keywords: ['clinical ai', 'oncology'] },
-    { id: 'jco-biomarkers-1', title: 'Biomarkers driving personalized cancer care', journal: 'Journal of Clinical Oncology', url: 'https://ascopubs.org/journal/jco', keywords: ['biomarkers', 'precision medicine'] },
-    { id: 'bmj-trials-1', title: 'Interpreting clinical trials for patients', journal: 'BMJ', url: 'https://www.bmj.com/', keywords: ['clinical trials', 'patient education'] },
-    { id: 'cell-genetherapy-1', title: 'Gene therapy: mechanisms to bedside', journal: 'Cell', url: 'https://www.cell.com/', keywords: ['gene therapy'] },
-    { id: 'science-collab-1', title: 'Science of collaboration in biomedicine', journal: 'Science', url: 'https://www.science.org/', keywords: ['collaboration', 'biomedicine'] },
-    { id: 'annals-neuro-1', title: 'Neurologic oncology: state of the art', journal: 'Annals of Internal Medicine', url: 'https://www.acpjournals.org/journal/aim', keywords: ['neurology', 'oncology'] },
-  ];
+  // Simple in-memory cache for searches
+  const pubCache = useRef(new Map());
+
+  // Load favorites on mount
+  useEffect(() => {
+    if (!userId || !API_BASE) return;
+    const fetchFavs = async () => {
+      try {
+        setFavLoading(true);
+        const res = await fetch(`${API_BASE}/api/favorites?user_id=${encodeURIComponent(userId)}`);
+        if (!res.ok) throw new Error('Failed to fetch favorites');
+        const data = await res.json();
+        setFavorites(Array.isArray(data) ? data : data.items || []);
+      } catch (e) {
+        // no-op for demo
+      } finally {
+        setFavLoading(false);
+      }
+    };
+    fetchFavs();
+  }, [userId]);
+
+  // Debounced PubMed search via backend
+  useEffect(() => {
+    const q = pubQuery.trim();
+    if (!API_BASE) return;
+    if (q.length < 3) {
+      setPubResults([]);
+      return;
+    }
+    const key = `pub:${q}`;
+    const cached = pubCache.current.get(key);
+    if (cached) {
+      setPubResults(cached);
+      return;
+    }
+    const id = setTimeout(async () => {
+      try {
+        setPubLoading(true);
+        const res = await fetch(`${API_BASE}/api/pubmed/search?query=${encodeURIComponent(q)}&max_results=10`);
+        if (!res.ok) throw new Error('PubMed search failed');
+        const data = await res.json();
+        const items = Array.isArray(data) ? data : data.results || [];
+        setPubResults(items);
+        pubCache.current.set(key, items);
+      } catch (e) {
+        setPubResults([]);
+      } finally {
+        setPubLoading(false);
+      }
+    }, 400);
+    return () => clearTimeout(id);
+  }, [pubQuery]);
 
   const filteredPublications = useMemo(() => {
-    const q = (pubQuery || '').toLowerCase().trim();
-    if (!q) return publicationsCorpus.slice(0, 5);
-    return publicationsCorpus.filter((p) =>
-      p.title.toLowerCase().includes(q) ||
-      p.journal.toLowerCase().includes(q) ||
-      p.keywords.some((k) => k.includes(q))
-    );
-  }, [pubQuery]);
+    if (pubResults.length > 0) return pubResults;
+    const corpus = [
+      { id: 'nejm-glioma-1', title: 'Targeted therapies for glioma: a 2024 overview', journal: 'NEJM', url: 'https://www.nejm.org/' },
+      { id: 'jama-lung-1', title: 'Screening advances in lung cancer', journal: 'JAMA', url: 'https://jamanetwork.com/' },
+      { id: 'natmed-immuno-1', title: 'New frontiers in immunotherapy', journal: 'Nature Medicine', url: 'https://www.nature.com/nm/' },
+      { id: 'lancet-ai-1', title: 'Clinical AI in oncology: promise and pitfalls', journal: 'The Lancet', url: 'https://www.thelancet.com/' },
+      { id: 'jco-biomarkers-1', title: 'Biomarkers driving personalized cancer care', journal: 'Journal of Clinical Oncology', url: 'https://ascopubs.org/journal/jco' },
+    ];
+    if (!pubQuery) return corpus;
+    const q = pubQuery.toLowerCase();
+    return corpus.filter((p) => p.title.toLowerCase().includes(q) || p.journal.toLowerCase().includes(q));
+  }, [pubResults, pubQuery]);
 
   const recommendations = useMemo(() => {
     if (!submitted) return null;
@@ -155,19 +241,99 @@ export default function AudienceOnboarding() {
     setInterests((prev) => (prev.includes(label) ? prev.filter((c) => c !== label) : [...prev, label]));
   };
 
-  const handleSubmit = (e) => {
+  const handlePatientSubmit = async (e) => {
     e.preventDefault();
     setSubmitted(true);
+    if (!API_BASE || !userId) return;
+    try {
+      const body = {
+        user_id: userId,
+        name: patient.name,
+        email: patient.email,
+        conditions,
+        city: locations.city,
+        country: locations.country,
+        global_experts: globalExperts,
+        pub_query: pubQuery,
+        submitted: true,
+      };
+      await fetch(`${API_BASE}/api/patient`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      // ignore in demo
+    }
   };
 
-  const addFavorite = (fav) => {
-    setFavorites((prev) => (prev.find((f) => f.id === fav.id && f.type === fav.type) ? prev : [...prev, fav]));
+  const handleResearcherSave = async () => {
+    if (!API_BASE || !userId) return;
+    try {
+      const body = {
+        user_id: userId,
+        specialties,
+        interests,
+        orcid,
+        researchgate_url: researchGate,
+        available_meetings: availableMeetings,
+      };
+      await fetch(`${API_BASE}/api/researcher`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      // Fetch mocked publications from ResearchGate/ORCID endpoint if provided
+      if (orcid || researchGate) {
+        setRgLoading(true);
+        const res = await fetch(`${API_BASE}/api/researchgate/publications`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ orcid, profile_url: researchGate }),
+        });
+        const data = await res.json();
+        setRgPubs(Array.isArray(data) ? data : data.items || []);
+        setRgLoading(false);
+      }
+    } catch (e) {
+      setRgLoading(false);
+    }
   };
+
+  const addFavorite = async (fav) => {
+    // optimistic update then persist
+    setFavorites((prev) => (prev.find((f) => f.ref_id === fav.ref_id && f.type === fav.type) ? prev : [...prev, fav]));
+    if (!API_BASE || !userId) return;
+    try {
+      await fetch(`${API_BASE}/api/favorites`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...fav, user_id: userId, role: activeFlow || 'patient' }),
+      });
+    } catch (e) {
+      // rollback not necessary for demo
+    }
+  };
+
   const removeFavorite = (fav) => {
-    setFavorites((prev) => prev.filter((f) => !(f.id === fav.id && f.type === fav.type)));
+    // Backend delete not implemented yet; just optimistic UI removal
+    setFavorites((prev) => prev.filter((f) => !(f.ref_id === fav.ref_id && f.type === fav.type)));
   };
 
-  const isFavorite = (fav) => favorites.some((f) => f.id === fav.id && f.type === fav.type);
+  const isFavorite = (fav) => favorites.some((f) => f.ref_id === fav.ref_id && f.type === fav.type);
+
+  const postQuestion = async (text) => {
+    if (!API_BASE || !userId || !text.trim()) return;
+    try {
+      const title = text.trim().slice(0, 60);
+      await fetch(`${API_BASE}/api/forums/questions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId, role: 'patient', title, body: text, tags: conditions.slice(0, 2) }),
+      });
+    } catch {}
+  };
 
   return (
     <section id="onboarding" className="relative bg-slate-50">
@@ -205,10 +371,8 @@ export default function AudienceOnboarding() {
           />
         </div>
 
-        {/* PATIENT FLOW */}
         {activeFlow === 'patient' && (
           <div className="mt-16 grid grid-cols-1 lg:grid-cols-5 gap-6">
-            {/* Left: Setup */}
             <div className="lg:col-span-3 rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
               <div className="flex items-start justify-between gap-4">
                 <div>
@@ -217,7 +381,30 @@ export default function AudienceOnboarding() {
                 </div>
               </div>
 
-              <form onSubmit={handleSubmit} className="mt-6 space-y-4">
+              <form onSubmit={handlePatientSubmit} className="mt-6 space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <label className="block">
+                    <span className="text-sm font-medium text-slate-800 flex items-center gap-2"><Fingerprint className="h-4 w-4" /> Name</span>
+                    <input
+                      type="text"
+                      value={patient.name}
+                      onChange={(e) => setPatient({ ...patient, name: e.target.value })}
+                      placeholder="Alex Taylor"
+                      className="mt-2 w-full rounded-xl border border-slate-200 bg-white/50 px-3 py-2.5 text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-sm font-medium text-slate-800 flex items-center gap-2"><Mail className="h-4 w-4" /> Email</span>
+                    <input
+                      type="email"
+                      value={patient.email}
+                      onChange={(e) => setPatient({ ...patient, email: e.target.value })}
+                      placeholder="alex@example.com"
+                      className="mt-2 w-full rounded-xl border border-slate-200 bg-white/50 px-3 py-2.5 text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
+                    />
+                  </label>
+                </div>
+
                 <label className="block">
                   <span className="text-sm font-medium text-slate-800 flex items-center gap-2"><Search className="h-4 w-4" /> Describe your condition</span>
                   <textarea
@@ -277,14 +464,13 @@ export default function AudienceOnboarding() {
                 </div>
 
                 <div className="pt-2">
-                  <button type="submit" className="inline-flex items-center px-5 py-3 rounded-md bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition">Continue</button>
+                  <button type="submit" className="inline-flex items-center px-5 py-3 rounded-md bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition">Save profile</button>
                 </div>
               </form>
 
-              {/* Step 5: Publications search */}
               <div className="mt-10 border-t border-slate-200 pt-6">
-                <h4 className="text-lg font-semibold text-slate-900 flex items-center gap-2"><BookOpen className="h-5 w-5" /> Recommended Publications</h4>
-                <p className="text-sm text-slate-600">Search by keywords to surface specific research papers from top journals.</p>
+                <h4 className="text-lg font-semibold text-slate-900 flex items-center gap-2"><BookOpen className="h-5 w-5" /> Publications</h4>
+                <p className="text-sm text-slate-600">Search via PubMed and save papers you care about. Results are cached for speed.</p>
                 <div className="mt-3 flex items-center gap-3">
                   <div className="relative flex-1">
                     <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
@@ -296,30 +482,32 @@ export default function AudienceOnboarding() {
                       className="w-full rounded-xl border border-slate-200 bg-white/50 pl-9 pr-3 py-2.5 text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent"
                     />
                   </div>
+                  {pubLoading && <LoadingInline label="Searching" />}
                 </div>
                 <ul className="mt-4 space-y-3">
                   {filteredPublications.map((p) => (
                     <li key={p.id} className="flex items-start justify-between gap-3 rounded-lg border border-slate-200 p-4">
                       <div>
                         <div className="font-medium text-slate-900">{p.title}</div>
-                        <div className="text-xs text-slate-500">{p.journal}</div>
-                        <a href={p.url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-sm text-sky-700 hover:text-sky-900">
-                          <LinkIcon className="h-4 w-4" /> View full paper
-                        </a>
+                        {p.journal && <div className="text-xs text-slate-500">{p.journal}{p.year ? ` • ${p.year}` : ''}</div>}
+                        {p.url && (
+                          <a href={p.url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-sm text-sky-700 hover:text-sky-900">
+                            <LinkIcon className="h-4 w-4" /> View full paper
+                          </a>
+                        )}
                       </div>
                       <button
-                        onClick={() => (isFavorite({ type: 'publication', id: p.id }) ? removeFavorite({ type: 'publication', id: p.id }) : addFavorite({ type: 'publication', id: p.id, title: p.title }))}
-                        className={`inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm ${isFavorite({ type: 'publication', id: p.id }) ? 'border-rose-200 text-rose-600 bg-rose-50' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
+                        onClick={() => (isFavorite({ type: 'publication', ref_id: p.id }) ? removeFavorite({ type: 'publication', ref_id: p.id }) : addFavorite({ type: 'publication', ref_id: p.id, title: p.title }))}
+                        className={`inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm ${isFavorite({ type: 'publication', ref_id: p.id }) ? 'border-rose-200 text-rose-600 bg-rose-50' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
                       >
-                        <Heart className={`h-4 w-4 ${isFavorite({ type: 'publication', id: p.id }) ? 'fill-rose-500 text-rose-500' : ''}`} />
-                        {isFavorite({ type: 'publication', id: p.id }) ? 'Saved' : 'Save'}
+                        <Heart className={`h-4 w-4 ${isFavorite({ type: 'publication', ref_id: p.id }) ? 'fill-rose-500 text-rose-500' : ''}`} />
+                        {isFavorite({ type: 'publication', ref_id: p.id }) ? 'Saved' : 'Save'}
                       </button>
                     </li>
                   ))}
                 </ul>
               </div>
 
-              {/* Step 6: Forums preview for patients */}
               <div className="mt-10 border-t border-slate-200 pt-6">
                 <h4 className="text-lg font-semibold text-slate-900 flex items-center gap-2"><MessageSquare className="h-5 w-5" /> Forums</h4>
                 <p className="text-sm text-slate-600">Spaces for discussions. Patients can post questions; only researchers can reply.</p>
@@ -330,10 +518,14 @@ export default function AudienceOnboarding() {
                 </div>
                 <div className="mt-4 rounded-xl border border-slate-200 p-4">
                   <label className="block text-sm font-medium text-slate-800 mb-2">Ask a question</label>
-                  <textarea className="w-full rounded-lg border border-slate-200 p-3 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500" placeholder="e.g., What are the eligibility criteria for glioma trials?" />
+                  <textarea id="patient-question" className="w-full rounded-lg border border-slate-200 p-3 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500" placeholder="e.g., What are the eligibility criteria for glioma trials?" />
                   <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
                     <span className="inline-flex items-center gap-1"><Shield className="h-3.5 w-3.5" /> Only researchers can reply</span>
-                    <button className="inline-flex items-center gap-2 rounded-md bg-slate-900 px-3 py-1.5 text-white">
+                    <button onClick={() => {
+                      const el = document.getElementById('patient-question');
+                      postQuestion(el?.value || '');
+                      if (el) el.value = '';
+                    }} className="inline-flex items-center gap-2 rounded-md bg-slate-900 px-3 py-1.5 text-white">
                       <Plus className="h-3.5 w-3.5" /> Post question
                     </button>
                   </div>
@@ -341,7 +533,6 @@ export default function AudienceOnboarding() {
               </div>
             </div>
 
-            {/* Right: Preview + Recommendations */}
             <div className="lg:col-span-2 rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
               <h3 className="text-xl font-semibold text-slate-900">What you’ll see</h3>
               <p className="text-sm text-slate-600">A personalized dashboard with recommended publications, health experts, and clinical trials.</p>
@@ -385,11 +576,11 @@ export default function AudienceOnboarding() {
                               <a href={p.url} target="_blank" rel="noreferrer" className="mt-1 inline-flex items-center gap-1 text-xs text-sky-700 hover:text-sky-900"><LinkIcon className="h-3.5 w-3.5" /> Full paper</a>
                             </div>
                             <button
-                              onClick={() => (isFavorite({ type: 'publication', id: p.id }) ? removeFavorite({ type: 'publication', id: p.id }) : addFavorite({ type: 'publication', id: p.id, title: p.title }))}
-                              className={`h-8 w-8 inline-flex items-center justify-center rounded-md border ${isFavorite({ type: 'publication', id: p.id }) ? 'border-rose-200 bg-rose-50 text-rose-600' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
+                              onClick={() => (isFavorite({ type: 'publication', ref_id: p.id }) ? removeFavorite({ type: 'publication', ref_id: p.id }) : addFavorite({ type: 'publication', ref_id: p.id, title: p.title }))}
+                              className={`h-8 w-8 inline-flex items-center justify-center rounded-md border ${isFavorite({ type: 'publication', ref_id: p.id }) ? 'border-rose-200 bg-rose-50 text-rose-600' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
                               aria-label="save publication"
                             >
-                              <Heart className={`h-4 w-4 ${isFavorite({ type: 'publication', id: p.id }) ? 'fill-rose-500 text-rose-500' : ''}`} />
+                              <Heart className={`h-4 w-4 ${isFavorite({ type: 'publication', ref_id: p.id }) ? 'fill-rose-500 text-rose-500' : ''}`} />
                             </button>
                           </li>
                         ))}
@@ -405,11 +596,11 @@ export default function AudienceOnboarding() {
                               <span className="block text-xs text-slate-500">{e.specialty} • {e.location}</span>
                             </div>
                             <button
-                              onClick={() => (isFavorite({ type: 'expert', id: e.id }) ? removeFavorite({ type: 'expert', id: e.id }) : addFavorite({ type: 'expert', id: e.id, title: e.name }))}
-                              className={`h-8 w-8 inline-flex items-center justify-center rounded-md border ${isFavorite({ type: 'expert', id: e.id }) ? 'border-rose-200 bg-rose-50 text-rose-600' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
+                              onClick={() => (isFavorite({ type: 'expert', ref_id: e.id }) ? removeFavorite({ type: 'expert', ref_id: e.id }) : addFavorite({ type: 'expert', ref_id: e.id, title: e.name }))}
+                              className={`h-8 w-8 inline-flex items-center justify-center rounded-md border ${isFavorite({ type: 'expert', ref_id: e.id }) ? 'border-rose-200 bg-rose-50 text-rose-600' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
                               aria-label="save expert"
                             >
-                              <Bookmark className={`h-4 w-4 ${isFavorite({ type: 'expert', id: e.id }) ? 'fill-rose-500 text-rose-500' : ''}`} />
+                              <Bookmark className={`h-4 w-4 ${isFavorite({ type: 'expert', ref_id: e.id }) ? 'fill-rose-500 text-rose-500' : ''}`} />
                             </button>
                           </li>
                         ))}
@@ -425,11 +616,11 @@ export default function AudienceOnboarding() {
                               <span className="block text-xs text-slate-500">{t.status}</span>
                             </div>
                             <button
-                              onClick={() => (isFavorite({ type: 'trial', id: t.id }) ? removeFavorite({ type: 'trial', id: t.id }) : addFavorite({ type: 'trial', id: t.id, title: t.title }))}
-                              className={`h-8 w-8 inline-flex items-center justify-center rounded-md border ${isFavorite({ type: 'trial', id: t.id }) ? 'border-rose-200 bg-rose-50 text-rose-600' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
+                              onClick={() => (isFavorite({ type: 'trial', ref_id: t.id }) ? removeFavorite({ type: 'trial', ref_id: t.id }) : addFavorite({ type: 'trial', ref_id: t.id, title: t.title }))}
+                              className={`h-8 w-8 inline-flex items-center justify-center rounded-md border ${isFavorite({ type: 'trial', ref_id: t.id }) ? 'border-rose-200 bg-rose-50 text-rose-600' : 'border-slate-200 text-slate-700 hover:bg-slate-50'}`}
                               aria-label="save trial"
                             >
-                              <Bookmark className={`h-4 w-4 ${isFavorite({ type: 'trial', id: t.id }) ? 'fill-rose-500 text-rose-500' : ''}`} />
+                              <Bookmark className={`h-4 w-4 ${isFavorite({ type: 'trial', ref_id: t.id }) ? 'fill-rose-500 text-rose-500' : ''}`} />
                             </button>
                           </li>
                         ))}
@@ -437,18 +628,17 @@ export default function AudienceOnboarding() {
                     </div>
                   </div>
 
-                  {/* Step 7: Favorites */}
                   <div className="mt-6 rounded-xl border border-slate-200 p-4">
-                    <h5 className="font-semibold text-slate-900 flex items-center gap-2"><Star className="h-4 w-4" /> My Favorites</h5>
+                    <h5 className="font-semibold text-slate-900 flex items-center gap-2"><Star className="h-4 w-4" /> My Favorites {favLoading && <LoadingInline label="Loading" />}</h5>
                     {favorites.length === 0 ? (
                       <p className="mt-2 text-sm text-slate-600">Save publications, clinical trials, and health experts to see them here.</p>
                     ) : (
                       <ul className="mt-3 space-y-2 text-sm text-slate-700">
-                        {favorites.map((f) => (
-                          <li key={`${f.type}-${f.id}`} className="flex items-center justify-between gap-2">
+                        {favorites.map((f, idx) => (
+                          <li key={`${f.type}-${f.ref_id}-${idx}`} className="flex items-center justify-between gap-2">
                             <span className="truncate">
                               <span className="uppercase text-xs text-slate-500 mr-2">{f.type}</span>
-                              {f.title || f.name || f.id}
+                              {f.title || f.name || f.ref_id}
                             </span>
                             <button onClick={() => removeFavorite(f)} className="text-xs text-slate-500 hover:text-rose-600">Remove</button>
                           </li>
@@ -462,10 +652,8 @@ export default function AudienceOnboarding() {
           </div>
         )}
 
-        {/* RESEARCHER FLOW */}
         {activeFlow === 'researcher' && (
           <div className="mt-16 grid grid-cols-1 lg:grid-cols-5 gap-6">
-            {/* Left: Profile setup */}
             <div className="lg:col-span-3 rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
               <h3 className="text-xl font-semibold text-slate-900">Profile setup (Researcher)</h3>
               <p className="text-sm text-slate-600">Provide background and expertise to connect with collaborators and opportunities.</p>
@@ -492,7 +680,7 @@ export default function AudienceOnboarding() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <label className="block">
                     <span className="text-sm font-medium text-slate-800">ORCID (optional)</span>
-                    <input value={orcid} onChange={(e) => setOrcid(e.target.value)} placeholder="https://orcid.org/0000-0000-0000-0000" className="mt-2 w-full rounded-xl border border-slate-200 bg-white/50 px-3 py-2.5 text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent" />
+                    <input value={orcid} onChange={(e) => setOrcid(e.target.value)} placeholder="0000-0000-0000-0000" className="mt-2 w-full rounded-xl border border-slate-200 bg-white/50 px-3 py-2.5 text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent" />
                   </label>
                   <label className="block">
                     <span className="text-sm font-medium text-slate-800">ResearchGate (optional)</span>
@@ -515,26 +703,39 @@ export default function AudienceOnboarding() {
                   </div>
                 </div>
 
-                {/* Auto-imported publications (mock) */}
+                <div className="flex items-center gap-3">
+                  <button onClick={handleResearcherSave} className="inline-flex items-center px-5 py-2.5 rounded-md bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition">Save profile</button>
+                  {rgLoading && <LoadingInline label="Fetching publications" />}
+                </div>
+
                 <div className="rounded-xl border border-slate-200 p-4">
                   <div className="flex items-center gap-2 text-slate-800"><BookOpen className="h-4 w-4" /> Publications</div>
                   <p className="mt-1 text-xs text-slate-500">If you add ORCID or ResearchGate, we’ll fetch your publications and generate simple summaries.</p>
                   <ul className="mt-3 space-y-3 text-sm text-slate-700">
-                    {[0,1].map((i) => (
-                      <li key={i} className="rounded-lg border border-slate-200 p-3">
-                        <div className="font-medium">AI-generated summary: concise and clear overview of your paper #{i+1}.</div>
-                        <div className="text-xs text-slate-500">Example journal • 2024</div>
-                        <div className="mt-2 flex items-center gap-2 text-xs text-slate-500">
-                          <CheckCircle className="h-3.5 w-3.5 text-emerald-500" /> Readability optimized
-                        </div>
-                      </li>
+                    {(rgPubs.length ? rgPubs : [0, 1]).map((item, idx) => (
+                      typeof item === 'number' ? (
+                        <li key={idx} className="rounded-lg border border-slate-200 p-3">
+                          <div className="font-medium">AI-generated summary: concise and clear overview of your paper #{idx + 1}.</div>
+                          <div className="text-xs text-slate-500">Example journal • 2024</div>
+                          <div className="mt-2 flex items-center gap-2 text-xs text-slate-500">
+                            <CheckCircle className="h-3.5 w-3.5 text-emerald-500" /> Readability optimized
+                          </div>
+                        </li>
+                      ) : (
+                        <li key={item.id || idx} className="rounded-lg border border-slate-200 p-3">
+                          <div className="font-medium">{item.title || 'Publication'}</div>
+                          <div className="text-xs text-slate-500">{item.journal || 'Journal'} {item.year ? `• ${item.year}` : ''}</div>
+                          {item.url && (
+                            <a href={item.url} target="_blank" rel="noreferrer" className="mt-1 inline-flex items-center gap-1 text-xs text-sky-700 hover:text-sky-900"><LinkIcon className="h-3.5 w-3.5" /> View</a>
+                          )}
+                        </li>
+                      )
                     ))}
                   </ul>
                 </div>
               </div>
             </div>
 
-            {/* Right: Dashboard preview */}
             <div className="lg:col-span-2 rounded-2xl border border-slate-200 bg-white p-6 sm:p-8">
               <h3 className="text-xl font-semibold text-slate-900">Researcher Dashboard</h3>
               <p className="text-sm text-slate-600">View clinical trials, discover collaborators, and manage forums.</p>
@@ -592,7 +793,6 @@ export default function AudienceOnboarding() {
           </div>
         )}
 
-        {/* Feature highlights */}
         <div id="features" className="mt-16 grid grid-cols-1 sm:grid-cols-3 gap-6">
           <div className="rounded-2xl border border-slate-200 bg-white p-6">
             <BookOpen className="h-5 w-5 text-slate-700" />
